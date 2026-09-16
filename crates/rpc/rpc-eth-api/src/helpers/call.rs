@@ -46,6 +46,33 @@ use revm::{
 use revm_inspectors::{access_list::AccessListInspector, transfer::TransferInspector};
 use tracing::{trace, warn};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrecedingTransactionResult {
+    #[serde(flatten)]
+    pub base: AccessListResult,
+
+    pub gas_refunded: Option<U256>,
+    pub pre_refund_gas_used: Option<U256>,
+    pub logs: Vec<Log>,
+    pub pending_block: U256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnhancedAccessListResult {
+    #[serde(flatten)]
+    pub base: AccessListResult,
+
+    pub gas_refunded: Option<U256>,
+    pub pre_refund_gas_used: Option<U256>,
+    pub logs: Vec<Log>,
+    pub pending_block: U256,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preceding_transactions: Vec<PrecedingTransactionResult>,
+}
+
 /// Result type for `eth_simulateV1` RPC method.
 pub type SimulatedBlocksResult<N, E> = Result<Vec<SimulatedBlock<RpcBlock<N>>>, E>;
 
@@ -443,6 +470,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         block_number: Option<BlockId>,
         state_override: Option<StateOverride>,
+         preceding_transactions: Option<Vec<RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>>>,
     ) -> impl Future<Output = Result<AccessListResult, Self::Error>> + Send
     where
         Self: Trace,
@@ -452,7 +480,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             let (evm_env, at) = self.evm_env_at(block_id).await?;
 
             self.spawn_blocking_io_fut(async move |this| {
-                this.create_access_list_with(evm_env, at, request, state_override).await
+                this.create_access_list_with(evm_env, at, request, state_override, preceding_transactions).await
             })
             .await
         }
@@ -466,6 +494,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         at: BlockId,
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         state_override: Option<StateOverride>,
+        preceding_transactions: Option<Vec<RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>>>,
     ) -> impl Future<Output = Result<AccessListResult, Self::Error>> + Send
     where
         Self: Trace,
@@ -482,8 +511,6 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             // Read fields from request before consuming it in create_txn_env
             let request_has_gas_limit = request.as_ref().gas_limit().is_some();
             let initial = request.as_ref().access_list().cloned().unwrap_or_default();
-
-            let mut tx_env = this.create_txn_env(&evm_env, request, &mut db)?;
 
             // we want to disable this in eth_createAccessList, since this is common practice used
             // by other node impls and providers <https://github.com/foundry-rs/foundry/issues/4388>
@@ -506,6 +533,114 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             // per-tx cap (2^24 ≈ 16.7M post-Osaka).
             evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
 
+            let pending_block = U256::from(evm_env.block_env.number);
+            let mut preceding_results = Vec::new();
+
+            if let Some(preceding_transactions) = preceding_transactions {
+                for preceding_request in preceding_transactions {
+                    let mut preceding_tx_env =
+                        this.create_txn_env(
+                            &evm_env,
+                            preceding_request.clone(),
+                            &mut db,
+                        )?;
+    
+                    if preceding_request.as_ref().gas_limit().is_none()
+                        && preceding_tx_env.gas_price() > 0
+                    {
+                        let cap =
+                            this.caller_gas_allowance(
+                                &mut db,
+                                &evm_env,
+                                &preceding_tx_env,
+                            )?;
+    
+                        preceding_tx_env.set_gas_limit(
+                            cap.min(evm_env.block_env.gas_limit)
+                        );
+                    }
+                    
+                    let gas_limit = preceding_tx_env.gas_limit();
+
+                    let result =
+                        this.transact_with_precompile_overrides(
+                            &mut db,
+                            evm_env.clone(),
+                            preceding_tx_env,
+                            precompile_overrides.clone(),
+                        )?;
+    
+                    let ResultAndState {
+                        result: execution_result,
+                        state,
+                    } = result;    
+                    
+                    let preceding_result = match execution_result {
+                        ExecutionResult::Halt { reason, gas_used } => {
+                            let error =
+                                Some(Self::Error::from_evm_halt(reason, gas_limit).to_string());
+
+                            PrecedingTransactionResult {
+                                base: AccessListResult {
+                                    access_list: AccessList::default(),
+                                    gas_used: U256::from(gas_used),
+                                    error,
+                                },
+                                gas_refunded: None,
+                                pre_refund_gas_used: None,
+                                logs: Vec::new(),
+                                pending_block,
+                            }
+                        }
+
+                        ExecutionResult::Revert { output, gas_used } => {
+                            let error = Some(RevertError::new(output).to_string());
+
+                            PrecedingTransactionResult {
+                                base: AccessListResult {
+                                    access_list: AccessList::default(),
+                                    gas_used: U256::from(gas_used),
+                                    error,
+                                },
+                                gas_refunded: None,
+                                pre_refund_gas_used: None,
+                                logs: Vec::new(),
+                                pending_block,
+                            }
+                        }
+
+                        ExecutionResult::Success {
+                            gas_used,
+                            gas_refunded,
+                            logs,
+                            ..
+                        } => {
+                            let gas_used = U256::from(gas_used);
+                            let gas_refunded = U256::from(gas_refunded);
+
+                            PrecedingTransactionResult {
+                                base: AccessListResult {
+                                    access_list: AccessList::default(),
+                                    gas_used,
+                                    error: None,
+                                },
+                                gas_refunded: Some(gas_refunded),
+                                pre_refund_gas_used: Some(
+                                    gas_used + gas_refunded
+                                ),
+                                logs,
+                                pending_block,
+                            }
+                        }
+                    };
+
+                    db.commit(state);
+                    preceding_results.push(preceding_result);
+                }
+            }
+
+            let mut tx_env = this.create_txn_env(&evm_env, request, &mut db)?;
+
             if !request_has_gas_limit && tx_env.gas_price() > 0 {
                 let cap = this.caller_gas_allowance(&mut db, &evm_env, &tx_env)?;
                 // no gas limit was provided in the request, so we need to cap the request's gas
@@ -513,29 +648,66 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 tx_env.set_gas_limit(cap.min(evm_env.block_env.gas_limit()));
             }
 
-            let mut inspector = AccessListInspector::new(initial);
+            // transact to get the exact gas used
+            let gas_limit = tx_env.gas_limit();
 
-            let result = this.inspect(&mut db, evm_env.clone(), tx_env.clone(), &mut inspector)?;
-            let access_list = inspector.into_access_list();
-            let gas_used = result.result.tx_gas_used();
-            tx_env.set_access_list(access_list.clone());
-            if let Err(err) = Self::Error::ensure_success(result.result) {
-                return Ok(AccessListResult {
-                    access_list,
-                    gas_used: U256::from(gas_used),
-                    error: Some(err.to_string()),
-                });
-            }
-
-            // transact again to get the exact gas used
             let result = this.transact(&mut db, evm_env, tx_env)?;
-            let gas_used = result.result.tx_gas_used();
-            let error = Self::Error::ensure_success(result.result).err().map(|e| e.to_string());
+            
+            let res = match result.result {
+                ExecutionResult::Halt { reason, gas_used } => {
+                    let error = Some(Self::Error::from_evm_halt(reason, gas_limit).to_string());
+                    EnhancedAccessListResult {
+                        base: AccessListResult {
+                            access_list: AccessList::default(),
+                            gas_used: U256::from(gas_used),
+                            error: error,
+                        },
+                        gas_refunded: None,
+                        pre_refund_gas_used: None,
+                        logs: Vec::new(),
+                        pending_block,
+                        preceding_transactions: preceding_results,
+                    }
+                }
+                ExecutionResult::Revert { output, gas_used } => {
+                    let error = Some(RevertError::new(output).to_string());
+                    EnhancedAccessListResult {
+                        base: AccessListResult {
+                            access_list: AccessList::default(),
+                            gas_used: U256::from(gas_used),
+                            error: error,
+                        },
+                        gas_refunded: None,
+                        pre_refund_gas_used: None,
+                        logs: Vec::new(),
+                        pending_block,
+                        preceding_transactions: preceding_results,
+                    }
+                }
+                ExecutionResult::Success { gas_used, gas_refunded, logs, .. } => {
+                    let gas_used = U256::from(gas_used);
+                    let gas_refunded = U256::from(gas_refunded);
+                    let pre_refund_gas_used = gas_used + gas_refunded;
 
-            Ok(AccessListResult { access_list, gas_used: U256::from(gas_used), error })
+                    EnhancedAccessListResult {
+                        base: AccessListResult {
+                            access_list: AccessList::default(),
+                            gas_used,
+                            error: None,
+                        },
+                        gas_refunded: Some(gas_refunded),
+                        pre_refund_gas_used: Some(pre_refund_gas_used),
+                        logs,
+                        pending_block,
+                        preceding_transactions: preceding_results,
+                    }
+                    
+                }
+            };
+
+            Ok(res)
         })
     }
-}
 
 /// Executes code on state.
 pub trait Call:
